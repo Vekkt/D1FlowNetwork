@@ -6,6 +6,9 @@ Run:     python tas_optimizer.py --kappa 20 --all-edges
          python tas_optimizer.py --twelve-contract-demo --all-edges
          python tas_optimizer.py --two-contract-demo
          python tas_optimizer.py --six-contract-demo
+         python tas_optimizer.py --dense-demo --no-plot
+         python tas_optimizer.py --dense-demo --screen-max-routes 48 --screen-max-incident 8
+         python tas_optimizer.py --no-screen --no-plot
          python tas_optimizer.py --all-filled-demo --plot all_filled.svg
          python tas_optimizer.py --plot network.svg --all-edges
          python tas_optimizer.py --self-test
@@ -47,6 +50,33 @@ unavailable reserve is nonzero. Core optimize_tas remains strict.
 
 Solver
 ------
+Screening is ON by default:
+1. Minimize brokerage with temporary capacities floor(min_k L[e,k]). If the
+   full hedge fits, P=1 and R=0, so this min-cost flow is already globally
+   optimal under the empirical model. No hybrid MILP is built.
+2. Otherwise solve a convex flow proxy C=sum_e legs[e]*(q[e]-m[e](q[e])).
+   C is an upper bound on R. Its integer marginal costs become parallel arcs.
+   A fee preference of 1e-7 residual lots per dollar stabilizes proxy ties.
+3. Protect a full minimum-fee feasible hedge and direct outright fallbacks.
+   Add entire proxy-flow paths in descending quantity order while respecting
+   default candidate budgets of 24 routes and 4 incident routes per maturity.
+   Small networks already within both budgets are retained intact.
+   Budgets may be exceeded ONLY by the protected set; this is reported.
+4. Optimize the original hybrid objective over retained routes. Screening
+   preserves feasibility but may exclude the full-network optimum. Increase
+   screen_max_routes / screen_max_incident to expand; zero removes a budget.
+   Use screen=False / --no-screen for the full-network comparison.
+5. Re-evaluate the hybrid allocation and both full-network screening flows
+   with the combined score. Return the best, using brokerage for ties. This
+   quality guard can return more orders than were admitted to the hybrid
+   MILP; output distinguishes solver candidates from actual submitted orders.
+   A hybrid time limit also falls back to the best feasible screening flow.
+   Such a selection is labelled feasible heuristic, never proven optimal.
+
+The temporary certainty capacities NEVER limit the subsequent submitted
+quantities. Results retain original A columns and edge order. The 156-route
+stress case is available as --dense-demo.
+
 An interval MILP represents integer q, min(q,L), and each stepwise p(q).
 Binary/continuous product linearizations represent P exactly, including zeros.
 Expected absolute residuals are integrated locally at each maturity, using
@@ -60,7 +90,8 @@ Results state whether R is exact or approximate. All integration rows share
 ONE submitted order vector; there are no later conditional decisions.
 The worked examples use exact integration. SciPy/HiGHS solves the resulting
 MILP to its numerical tolerances, then minimizes brokerage at the best J.
-Timeouts raise instead of presenting an unproved optimum. This is not a
+With screening disabled, timeouts raise. With screening enabled, an unproved
+feasible fallback is explicitly labelled. Other solver errors raise. This is not a
 classical linear per-unit-cost transshipment solver.
 
 R takes absolute values BEFORE averaging; abs(b - A @ mean_fill) is only a
@@ -88,7 +119,7 @@ distances, rather than approximating exchange calendars with weekdays.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from itertools import product
 from math import exp, fsum, isfinite, log
@@ -96,7 +127,7 @@ from time import perf_counter
 from typing import Mapping, Sequence
 
 import numpy as np
-from scipy.optimize import Bounds, LinearConstraint, milp
+from scipy.optimize import Bounds, LinearConstraint, milp, linprog
 from scipy.sparse import coo_matrix
 
 
@@ -349,6 +380,15 @@ class OptimizationResult:
     brokerage_rates: np.ndarray
     brokerage_if_fully_filled: float
     expected_brokerage: float
+    solver_path: str = "hybrid"
+    optimality_scope: str = "full network"
+    original_route_count: int = 0
+    candidate_indices: tuple[int, ...] = ()
+    screening_seconds: float = 0.0
+    screening_shortfall_bound: float | None = None
+    screening_notes: tuple[str, ...] = ()
+    selection_source: str = "hybrid optimum"
+    screened_objective_value: float | None = None
 
 
 @dataclass
@@ -504,13 +544,20 @@ def evaluate_allocation(
     _validate_settings(kappa, exact_state_limit, residual_samples, seed, None)
     b, q = b.astype(np.int64), q.astype(np.int64)
     bound = int(max(b[b > 0].sum(), -b[b < 0].sum()))
-    rules = _residual_rules(A, edges, bound, exact_state_limit=exact_state_limit,
+    # For a FIXED order vector, collapse liquidity above that order size.
+    # Unused edges and orders certain to fill become deterministic, often
+    # making evaluation exact even when optimizing over all sizes was sampled.
+    evaluation_edges = tuple(replace(edge, forecast=FillForecast(
+        np.minimum(size, edge.forecast.accessible_volume), edge.forecast.weights))
+        for edge, size in zip(edges, q))
+    rules = _residual_rules(A, evaluation_edges, bound, exact_state_limit=exact_state_limit,
                             residual_samples=residual_samples, seed=seed)
     p, means, log_joint, joint, residual = _allocation_metrics(A, b, edges, q, rules)
     return dict(joint_probability=joint, expected_residual=float(residual.sum()),
                 residual_by_maturity=residual, mean_fills=means, h_hat=A @ means,
                 objective_value=float(residual.sum() + kappa * (1 - joint)),
                 residual_is_exact=all(rule.exact for rule in rules),
+                residual_state_count=sum(len(rule.weights) for rule in rules if rule.edge_indices),
                 brokerage_if_fully_filled=float(sum(edge.brokerage_per_lot * size
                                                      for edge, size in zip(edges, q))))
 
@@ -524,6 +571,10 @@ def _validate_settings(kappa, exact_state_limit, residual_samples, seed, time_li
             raise ValueError(f"{name} must be an integer >= {minimum}.")
     if time_limit is not None and (not isfinite(time_limit) or time_limit <= 0):
         raise ValueError("time_limit must be positive.")
+
+
+class SolverLimitReached(RuntimeError):
+    """No optimality proof before the configured solver limit."""
 
 
 class _LinearModel:
@@ -557,7 +608,7 @@ class _LinearModel:
         return LinearConstraint(matrix, self.row_lower, self.row_upper)
 
 
-def optimize_tas(
+def _optimize_hybrid(
     contracts: Sequence[str], edges: Sequence[Edge], hedge: Sequence[int],
     *, kappa: float = 20.0, exact_state_limit: int = 4096,
     residual_samples: int = 2048, seed: int = 2026,
@@ -692,6 +743,8 @@ def optimize_tas(
                      constraints=base_constraint, options=options)
         if first.status == 2:
             raise ValueError("The available TAS network cannot execute the full target without round trips.")
+        if first.status == 1:
+            raise SolverLimitReached(f"Combined-objective optimality not established: {first.message}")
         if first.status != 0 or first.x is None:
             raise RuntimeError(f"Combined-objective optimality not established: {first.message}")
         first_q = np.rint(first.x[q_vars]).astype(np.int64)
@@ -722,6 +775,8 @@ def optimize_tas(
             second = milp(secondary, integrality=integrality, bounds=secondary_bounds,
                           constraints=[base_constraint, locked_score],
                           options={**options, "presolve": False})
+        if second.status == 1:
+            raise SolverLimitReached(f"Brokerage tie-break optimality not established: {second.message}")
         if second.status != 0 or second.x is None:
             raise RuntimeError(f"Brokerage tie-break optimality not established: {second.message}")
         raw_q = second.x[q_vars]
@@ -749,8 +804,333 @@ def optimize_tas(
         expected_brokerage=float(fees @ means))
 
 
+@dataclass
+class RouteScreen:
+    candidate_indices: tuple[int, ...]
+    feasible_backbone: np.ndarray
+    proxy_orders: np.ndarray
+    shortfall_bound: float
+    seconds: float
+    notes: tuple[str, ...]
+
+
+def _cancel_flow_cycles(edges, quantities):
+    """Only for monotone-cost screening flows, NEVER for a hybrid solution."""
+    q = np.array(quantities, dtype=np.int64, copy=True)
+    nodes = list(dict.fromkeys(node for edge in edges for node in (edge.source, edge.destination)))
+    while True:
+        adjacency = {node: [] for node in nodes}
+        for e, edge in enumerate(edges):
+            if q[e]:
+                adjacency[edge.source].append((edge.destination, e))
+        state, path_nodes, path_edges = {}, [], []
+        def visit(node):
+            state[node] = 1
+            path_nodes.append(node)
+            for destination, e in adjacency[node]:
+                if state.get(destination) == 1:
+                    return path_edges[path_nodes.index(destination):] + [e]
+                if not state.get(destination):
+                    path_edges.append(e)
+                    cycle = visit(destination)
+                    if cycle is not None:
+                        return cycle
+                    path_edges.pop()
+            path_nodes.pop()
+            state[node] = 2
+            return None
+        cycle = None
+        for node in nodes:
+            if not state.get(node):
+                cycle = visit(node)
+                if cycle is not None:
+                    break
+        if cycle is None:
+            return q
+        q[cycle] -= min(q[e] for e in cycle)
+
+
+def _integer_flow(cost, matrix, b, capacities, *, time_limit=None, allow_infeasible=False):
+    """LP on a network incidence matrix with integer capacities and balances.
+
+    Its vertices are integral. Reject numerical nonintegrality instead of
+    rounding an invalid hedge. No probability or residual scenarios are used.
+    """
+    options = {} if time_limit is None else {"time_limit": float(time_limit)}
+    answer = linprog(cost, A_eq=matrix, b_eq=b,
+                     bounds=[(0, int(capacity)) for capacity in capacities],
+                     method="highs", options=options)
+    if answer.status == 2 and allow_infeasible:
+        return None
+    if answer.status == 2:
+        raise ValueError("The available TAS network cannot execute the full target.")
+    if not answer.success or answer.x is None:
+        raise RuntimeError(f"Screening flow optimality not established: {answer.message}")
+    q = np.rint(answer.x).astype(np.int64)
+    if (np.max(np.abs(answer.x - q), initial=0) > 1e-5
+            or not np.array_equal(matrix @ q, b)
+            or np.any(q < 0) or np.any(q > capacities)):
+        raise RuntimeError("Screening flow failed integer/capacity/balance checks.")
+    return q
+
+
+def _flow_paths(contracts, edges, b, q):
+    """Decompose an acyclic feasible flow into whole supply-to-demand paths."""
+    remaining = q.copy()
+    balances = {None: -int(b.sum()), **dict(zip(contracts, map(int, b)))}
+    adjacency = {node: [] for node in balances}
+    for e, edge in enumerate(edges):
+        adjacency[edge.source].append((edge.destination, e))
+    paths = []
+    def find(node, visited):
+        if balances[node] > 0:
+            return node, []
+        for destination, e in adjacency[node]:
+            if remaining[e] > 0 and destination not in visited:
+                result = find(destination, visited | {destination})
+                if result is not None:
+                    sink, path = result
+                    return sink, [e, *path]
+        return None
+    for source in balances:
+        while balances[source] < 0:
+            found = find(source, {source})
+            if found is None:
+                raise RuntimeError("A screening flow could not be decomposed into complete paths.")
+            sink, path = found
+            amount = min(-balances[source], balances[sink], min(remaining[e] for e in path))
+            remaining[path] -= amount
+            balances[source] += amount
+            balances[sink] -= amount
+            paths.append((int(amount), tuple(path)))
+    return paths
+
+
+def screen_routes(contracts, edges, hedge, *, max_routes=24, max_incident=4,
+                  time_limit=None) -> RouteScreen:
+    """Keep a feasible backbone, then admit whole proxy-flow paths by size.
+
+    The proxy minimizes C=sum_e |A[:,e]|_1*(q_e-E[F_e]), an upper bound on R.
+    Convex integer marginal-cost tiers make this a small network-flow LP.
+    A tiny, documented fee preference (1e-7 residual lots per dollar) resolves
+    practical proxy degeneracy; it does not modify the final hybrid objective.
+
+    Protected: a complete minimum-brokerage hedge, plus one direct outright
+    in the required direction for each nonzero target when available.
+    Candidate budgets are soft ONLY for that protected set. Zero means no
+    budget. Excluded routes are a heuristic restriction, not a proof that
+    they cannot improve the original combined objective.
+    """
+    started = perf_counter()
+    contracts, edges = tuple(contracts), tuple(edges)
+    A = incidence_matrix(contracts, edges)
+    raw_b = np.asarray(hedge, dtype=float)
+    if (raw_b.shape != (len(contracts),) or not np.all(np.isfinite(raw_b))
+            or not np.all(raw_b == np.rint(raw_b))):
+        raise ValueError("hedge must contain one finite integer per maturity.")
+    for value, name in ((max_routes, "max_routes"), (max_incident, "max_incident")):
+        if not isfinite(value) or int(value) != value or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer; zero disables the budget.")
+    if time_limit is not None and (not isfinite(time_limit) or time_limit <= 0):
+        raise ValueError("time_limit must be positive.")
+    b = raw_b.astype(np.int64)
+    bound = int(max(b[b > 0].sum(), -b[b < 0].sum()))
+    if not bound:
+        zeros = np.zeros(len(edges), dtype=np.int64)
+        return RouteScreen((), zeros, zeros.copy(), 0.0, perf_counter() - started, ())
+    if not edges:
+        raise ValueError("No TAS routes can execute the nonzero target.")
+    fees = np.array([edge.brokerage_per_lot for edge in edges])
+    backbone = _integer_flow(fees, A, b, np.full(len(edges), bound), time_limit=time_limit)
+    backbone = _cancel_flow_cycles(edges, backbone)
+    keep = set(map(int, np.flatnonzero(backbone)))
+    for i, contract in enumerate(contracts):
+        if b[i] == 0:
+            continue
+        matching = [e for e, edge in enumerate(edges)
+                    if (b[i] > 0 and edge.source is None and edge.destination == contract)
+                    or (b[i] < 0 and edge.source == contract and edge.destination is None)]
+        if matching:
+            keep.add(min(matching, key=lambda e: (fees[e], e)))
+
+    owners, costs, capacities = [], [], []
+    for e, edge in enumerate(edges):
+        # Include floor and ceil around fractional L. The discrete marginal
+        # costs are then exact for every integer submitted quantity.
+        breaks = {0, bound}
+        for value in edge.forecast.accessible_volume:
+            for point in (int(np.floor(value)), int(np.floor(value)) + 1):
+                if 0 < point < bound:
+                    breaks.add(point)
+        points = sorted(breaks)
+        legs = int(np.abs(A[:, e]).sum())
+        for lo, hi in zip(points, points[1:]):
+            slope = legs * (1 - (edge.forecast.mean_fill(hi) - edge.forecast.mean_fill(lo)) / (hi - lo))
+            owners.append(e)
+            costs.append(max(0.0, slope) + 1e-7 * fees[e])
+            capacities.append(hi - lo)
+    owners = np.asarray(owners, dtype=int)
+    tier_q = _integer_flow(np.asarray(costs), A[:, owners], b, np.array(capacities), time_limit=time_limit)
+    proxy = np.bincount(owners, weights=tier_q, minlength=len(edges)).astype(np.int64)
+    proxy = _cancel_flow_cycles(edges, proxy)
+    shortfall = float(sum(np.abs(A[:, e]).sum() * (size - edge.forecast.mean_fill(int(size)))
+                          for e, (edge, size) in enumerate(zip(edges, proxy))))
+    if (max_routes and max_incident and len(edges) <= max_routes
+            and np.max(np.count_nonzero(A, axis=1), initial=0) <= max_incident):
+        return RouteScreen(tuple(range(len(edges))), backbone, proxy, shortfall,
+                           perf_counter() - started, ("Network already fits both candidate budgets; all routes retained.",))
+    paths = sorted(_flow_paths(contracts, edges, b, proxy), key=lambda item: (-item[0], len(item[1]), item[1]))
+    protected = keep.copy()
+    skipped = 0
+    for amount, path in paths:
+        proposed = keep | set(path)
+        degrees = np.count_nonzero(A[:, sorted(proposed)], axis=1)
+        if ((max_routes and len(proposed) > max_routes)
+                or (max_incident and np.max(degrees, initial=0) > max_incident)):
+            skipped += 1
+        else:
+            keep = proposed
+    indices = tuple(sorted(keep))
+    if (not np.array_equal(A[:, list(indices)] @ backbone[list(indices)], b)
+            or not _is_acyclic(edges, backbone)):
+        raise RuntimeError("Screened graph lost the protected feasible hedge.")
+    notes = []
+    protected_degree = np.max(np.count_nonzero(A[:, sorted(protected)], axis=1), initial=0)
+    if (max_routes and len(protected) > max_routes) or (max_incident and protected_degree > max_incident):
+        notes.append("Candidate limits exceeded to preserve the feasible backbone and direct fallbacks.")
+    if skipped:
+        notes.append(f"{skipped} proxy-flow paths excluded by route/incident budgets.")
+    if len(indices) < len(edges):
+        notes.append("Screening can exclude the globally best allocation; increase budgets or disable screening to compare.")
+    return RouteScreen(indices, backbone, proxy, shortfall, perf_counter() - started, tuple(notes))
+
+
+def optimize_tas(
+    contracts, edges, hedge, *, kappa=20.0, exact_state_limit=4096,
+    residual_samples=2048, seed=2026, time_limit=None,
+    screen=True, screen_max_routes=24, screen_max_incident=4,
+) -> OptimizationResult:
+    """Certain-fill fast path, feasible route screening, then hybrid optimization.
+
+    q and A always refer to the ORIGINAL input edge order. candidate_indices
+    identifies columns offered to the hybrid MILP. A quality-guard selection
+    of the full-network proxy flow can also use routes outside that subset.
+    screen=False runs the original full-network hybrid MILP for comparison.
+    Compare the returned hybrid plan to both feasible screening flows using
+    the original combined score. On a hybrid time limit, return the best
+    screening flow explicitly labelled unproved. Other solver errors raise.
+    """
+    started = perf_counter()
+    contracts, edges = tuple(contracts), tuple(edges)
+    A = incidence_matrix(contracts, edges)
+    raw_b = np.asarray(hedge, dtype=float)
+    if (raw_b.shape != (len(contracts),) or not np.all(np.isfinite(raw_b))
+            or not np.all(raw_b == np.rint(raw_b))):
+        raise ValueError("hedge must contain one finite integer per maturity.")
+    _validate_settings(kappa, exact_state_limit, residual_samples, seed, time_limit)
+    for value in (screen_max_routes, screen_max_incident):
+        if not isfinite(value) or int(value) != value or value < 0:
+            raise ValueError("Screening budgets must be nonnegative integers; zero disables a budget.")
+    b = raw_b.astype(np.int64)
+    settings = dict(kappa=kappa, exact_state_limit=exact_state_limit,
+                    residual_samples=residual_samples, seed=seed, time_limit=time_limit)
+    all_indices = tuple(range(len(edges)))
+    if not screen:
+        result = _optimize_hybrid(contracts, edges, b, **settings)
+        return replace(result, original_route_count=len(edges), candidate_indices=all_indices,
+                       solve_seconds=perf_counter() - started)
+
+    bound = int(max(b[b > 0].sum(), -b[b < 0].sum()))
+    fees = np.array([edge.brokerage_per_lot for edge in edges])
+    if bound == 0:
+        certain_q = np.zeros(len(edges), dtype=np.int64)
+    elif not edges:
+        raise ValueError("No TAS routes can execute the nonzero target.")
+    else:
+        certain_caps = np.array([min(bound, int(np.floor(min(edge.forecast.accessible_volume)))) for edge in edges])
+        certain_q = _integer_flow(fees, A, b, certain_caps, time_limit=time_limit, allow_infeasible=True)
+    if certain_q is not None:
+        certain_q = _cancel_flow_cycles(edges, certain_q)
+        if not np.array_equal(A @ certain_q, b):
+            raise RuntimeError("Certain-fill flow failed the hedge balance check.")
+        return OptimizationResult(
+            contracts=contracts, edges=edges, A=A, b=b, q=certain_q,
+            full_fill_probabilities=np.ones(len(edges)), mean_fills=certain_q.astype(float),
+            h_hat=b.astype(float), joint_probability=1.0, log_joint_probability=0.0,
+            kappa=float(kappa), residual_by_maturity=np.zeros(len(b)), expected_residual=0.0,
+            objective_value=0.0, residual_is_exact=True, residual_state_count=0,
+            residual_samples=residual_samples, seed=seed, solve_seconds=perf_counter() - started,
+            probability_band_count=0, brokerage_rates=fees,
+            brokerage_if_fully_filled=float(fees @ certain_q), expected_brokerage=float(fees @ certain_q),
+            solver_path="certain-fill min-cost flow", optimality_scope="full network",
+            original_route_count=len(edges), candidate_indices=all_indices,
+            screening_seconds=perf_counter() - started,
+            selection_source="certain-fill optimum",
+            screening_notes=("P=1 and R=0 under the empirical model; the hybrid MILP was unnecessary.",))
+
+    candidates = screen_routes(contracts, edges, b, max_routes=screen_max_routes,
+                               max_incident=screen_max_incident, time_limit=time_limit)
+    screen_seconds = perf_counter() - started
+    indices = list(candidates.candidate_indices)
+    notes = list(candidates.notes)
+    result = None
+    try:
+        result = _optimize_hybrid(contracts, [edges[e] for e in indices], b, **settings)
+    except SolverLimitReached as exc:
+        notes.append(str(exc))
+        notes.append("Hybrid solver limit reached; returning a feasible screening plan without an optimality claim.")
+    choices = [("expected-shortfall flow", candidates.proxy_orders),
+               ("minimum-brokerage backbone", candidates.feasible_backbone)]
+    if result is not None:
+        hybrid_q = np.zeros(len(edges), dtype=np.int64)
+        hybrid_q[indices] = result.q
+        choices.insert(0, ("hybrid optimum", hybrid_q))
+    evaluation_settings = dict(kappa=kappa, exact_state_limit=exact_state_limit,
+                               residual_samples=residual_samples, seed=seed)
+    scored = [(source, orders, evaluate_allocation(contracts, edges, b, orders, **evaluation_settings))
+              for source, orders in choices]
+    best = min(entry[2]["objective_value"] for entry in scored)
+    ties = [entry for entry in scored if entry[2]["objective_value"] <= best + 1e-8]
+    source, q, metrics = min(ties, key=lambda entry: entry[2]["brokerage_if_fully_filled"])
+    if source != "hybrid optimum":
+        notes.append(f"Quality guard selected the {source}; screened optimization did not improve its combined score.")
+    if not all(entry[2]["residual_is_exact"] for entry in scored):
+        notes.append("At least one candidate score uses sampled residuals; quality comparisons are estimates.")
+    probabilities = np.array([edge.forecast.probability(int(size)) for edge, size in zip(edges, q)])
+    log_joint = -np.inf if np.any(probabilities == 0) else fsum(log(p) for p in probabilities)
+    scope = "retained routes" if len(indices) < len(edges) else "full network"
+    if source != "hybrid optimum":
+        scope = "feasible heuristic; not proven optimal"
+    elif not result.residual_is_exact:
+        scope += " under sampled optimization"
+    return OptimizationResult(
+        contracts=contracts, edges=edges, A=A, b=b, q=q,
+        full_fill_probabilities=probabilities, mean_fills=metrics["mean_fills"], h_hat=metrics["h_hat"],
+        joint_probability=metrics["joint_probability"], log_joint_probability=log_joint,
+        kappa=float(kappa), residual_by_maturity=metrics["residual_by_maturity"],
+        expected_residual=metrics["expected_residual"], objective_value=metrics["objective_value"],
+        residual_is_exact=metrics["residual_is_exact"], residual_state_count=metrics["residual_state_count"],
+        residual_samples=residual_samples, seed=seed, solve_seconds=perf_counter() - started,
+        probability_band_count=0 if result is None else result.probability_band_count,
+        brokerage_rates=fees, brokerage_if_fully_filled=float(fees @ q),
+        expected_brokerage=float(fees @ metrics["mean_fills"]), solver_path="screened hybrid with quality guard",
+        optimality_scope=scope, original_route_count=len(edges), candidate_indices=tuple(indices),
+        screening_seconds=screen_seconds, screening_shortfall_bound=candidates.shortfall_bound,
+        screening_notes=tuple(notes), selection_source=source,
+        screened_objective_value=None if result is None else scored[0][2]["objective_value"])
+
+
 def print_result(result: OptimizationResult) -> None:
     """Display actual contract targets; never report a tradable OR balance."""
+    print(f"Solver: {result.solver_path}; optimality scope: {result.optimality_scope}")
+    print(f"Candidate routes: {len(result.candidate_indices)} / {result.original_route_count}; screening {result.screening_seconds:.4f} s")
+    print(f"Returned plan: {result.selection_source}; submitted orders: {np.count_nonzero(result.q)}")
+    if result.screened_objective_value is not None:
+        print(f"Screened hybrid allocation score before quality check: {result.screened_objective_value:.6f}")
+    if result.screening_shortfall_bound is not None:
+        print(f"Full-network proxy expected-leg-shortfall bound: {result.screening_shortfall_bound:.6f}")
+    for note in result.screening_notes:
+        print(note)
     print("A: contract rows, directed-edge columns")
     print(result.A)
     print("Columns:", "; ".join(f"{i}: {edge.name}" for i, edge in enumerate(result.edges)))
@@ -1023,7 +1403,8 @@ def export_network_svg(result, path, *, show_unused=False, reference_quantity=10
                        f"brokerage=${float(rates[e]):.4f}/lot")
         else:
             probability = edge.forecast.probability(int(reference_quantity))
-            tooltip = (f"E{e + 1}: {edge.name}; unused (q=0); "
+            status = "excluded by screening" if e not in result.candidate_indices else "unused"
+            tooltip = (f"E{e + 1}: {edge.name}; {status} (q=0); "
                        f"full-fill probability at {reference_quantity} lots={probability:.4%}; "
                        f"brokerage=${float(rates[e]):.4f}/lot")
         svg.append(f'<path d="{d}" fill="none" stroke="{color}" stroke-width="{thickness}" '
@@ -1113,6 +1494,9 @@ def export_network_svg(result, path, *, show_unused=False, reference_quantity=10
         svg.append(f'<text x="52" y="{table_top + 61}" fill="#526678" font-size="13">No orders required.</text>')
     svg.append(f'<text x="45" y="{height - 28}" fill="#526678" font-size="12">'
                'Probabilities are volume-based estimates; brokerage rates are supplied per executed edge-lot.</text>')
+    route_note = (f'{result.solver_path}; candidates {len(result.candidate_indices)}/{result.original_route_count}; '
+                  f'optimality scope: {result.optimality_scope}.')
+    svg.append(f'<text x="45" y="{height - 10}" fill="#526678" font-size="12">{escape(route_note)}</text>')
     svg.extend(['</g>', '</svg>'])
     path.write_text("\n".join(svg) + "\n", encoding="utf-8")
     return path
@@ -1196,6 +1580,23 @@ def six_contract_demo(**optimizer_options) -> OptimizationResult:
                         [800, -700, 600, -500, 600, -800], **optimizer_options)
 
 
+def dense_network_demo(*, all_filled=False, **optimizer_options) -> OptimizationResult:
+    """Reproducible 156-route / 4,000-gross-lot stress case; all 12 TAS-open."""
+    rng = np.random.default_rng(20261112)
+    contracts = [f"M{i + 1}" for i in range(12)]
+    certain = FillForecast([4000], [1])
+    outright = {name: (certain if all_filled else FillForecast(
+        [int(rng.integers(100, 301)), int(rng.integers(400, 701)), 1800], [.2, .5, .3]))
+        for name in contracts}
+    spreads = {(contracts[i], contracts[j]): (certain if all_filled else FillForecast(
+        [int(rng.integers(20, 101)), int(rng.integers(150, 351)), 900], [.2, .5, .3]))
+        for i in range(12) for j in range(i + 1, 12)}
+    edges = make_edges(contracts, outright, spreads, outright_brokerage=1, spread_brokerage=1.5)
+    optimizer_options.setdefault("time_limit", 60)
+    return optimize_tas(contracts, edges, [1200, -900, 600, -800, 0, 0, 0, 500, 0, 0, 0, 0],
+                        **optimizer_options)
+
+
 def all_filled_demo(spread_fee: float = 1.5, **optimizer_options) -> OptimizationResult:
     """Every edge supports the entire target with probability 1.
 
@@ -1209,6 +1610,125 @@ def all_filled_demo(spread_fee: float = 1.5, **optimizer_options) -> Optimizatio
                        {("Feb27", "Mar27"): certain},
                        outright_brokerage=1.0, spread_brokerage=spread_fee)
     return optimize_tas(contracts, edges, [100, -100], **optimizer_options)
+
+
+def _screening_self_test() -> int:
+    """Screening correctness, feasibility protection and quality/timeout checks."""
+    checks = 0
+    certain = FillForecast([100], [1])
+    cheap = all_filled_demo()
+    expensive = all_filled_demo(3)
+    assert cheap.solver_path == expensive.solver_path == "certain-fill min-cost flow"
+    assert cheap.objective_value == expensive.objective_value == 0
+    assert cheap.brokerage_if_fully_filled == 150 and expensive.brokerage_if_fully_filled == 200
+    assert cheap.optimality_scope == "full network"
+    checks += 1
+
+    fractional = optimize_tas(["A"], [Edge("A", None, "A", FillForecast([99.5], [1]), 1)], [100])
+    assert fractional.q.tolist() == [100] and fractional.joint_probability == 0
+    assert fractional.expected_residual == .5
+    checks += 1
+
+    # Tight budgets must not disconnect a target with no outright route.
+    path = [Edge("Buy B", None, "B", FillForecast([50], [1]), 1),
+            Edge("B to A", "B", "A", FillForecast([50], [1]), 1)]
+    protected = screen_routes(["A", "B"], path, [100, 0], max_routes=1, max_incident=1)
+    assert protected.candidate_indices == (0, 1)
+    assert protected.feasible_backbone.tolist() == [100, 100]
+    assert any("exceeded" in note for note in protected.notes)
+    checks += 1
+
+    # The quality guard must reject an aggressively pruned, poor allocation.
+    edges = [Edge("Cheap but empty A", None, "A", FillForecast([0], [1]), .1),
+             Edge("Buy B", None, "B", FillForecast([99], [1]), 1),
+             Edge("B to A", "B", "A", FillForecast([99], [1]), 1)]
+    filtered = screen_routes(["A", "B"], edges, [100, 0], max_routes=1, max_incident=1)
+    assert filtered.candidate_indices == (0,)
+    guarded = optimize_tas(["A", "B"], edges, [100, 0], screen_max_routes=1, screen_max_incident=1)
+    assert guarded.expected_residual == 1 and guarded.objective_value == 21
+    assert guarded.screened_objective_value == 120
+    assert guarded.selection_source == "expected-shortfall flow"
+    assert guarded.optimality_scope == "feasible heuristic; not proven optimal"
+    assert guarded.A.shape == (2, 3) and guarded.q.shape == (3,)
+    assert np.array_equal(guarded.A @ guarded.q, guarded.b)
+    assert any(guarded.q[e] > 0 for e in set(range(3)) - set(guarded.candidate_indices))
+    checks += 1
+
+    unlimited = screen_routes(["A", "B"], edges, [100, 0], max_routes=0, max_incident=0)
+    assert set(np.flatnonzero(unlimited.proxy_orders)) <= set(unlimited.candidate_indices)
+    assert set(np.flatnonzero(unlimited.feasible_backbone)) <= set(unlimited.candidate_indices)
+    score = evaluate_allocation(["A", "B"], edges, [100, 0], unlimited.proxy_orders)
+    assert score["expected_residual"] <= unlimited.shortfall_bound + 1e-8
+    checks += 1
+
+    # Retain already-small networks, including parallel alternatives whose
+    # preference can change with kappa.
+    small = screen_routes(["A", "B"], edges, [100, 0])
+    assert small.candidate_indices == (0, 1, 2)
+    checks += 1
+
+    # Verify discrete marginal tiers with fractional accessible volumes.
+    fractional_edges = [Edge("Left", None, "A", FillForecast([1.5, 3], [.6, .4]), 1),
+                        Edge("Right", None, "A", FillForecast([.5, 2], [.4, .6]), 1)]
+    screened = screen_routes(["A"], fractional_edges, [3], max_routes=0, max_incident=0)
+    brute = min(sum(q - e.forecast.mean_fill(q) for e, q in zip(fractional_edges, (left, 3-left)))
+                for left in range(4))
+    assert np.isclose(screened.shortfall_bound, brute)
+    assert np.array_equal(incidence_matrix(["A"], fractional_edges) @ screened.proxy_orders, [3])
+    checks += 1
+
+    # Fixed-plan evaluation removes unused uncertainty before enumerating.
+    irrelevant = [Edge("Buy A", None, "A", certain, 1)]
+    irrelevant += [Edge(f"Extra {i}", None, "A", FillForecast([0, 50, 100], [.2, .5, .3]), 2)
+                   for i in range(8)]
+    assessed = evaluate_allocation(["A"], irrelevant, [100], [100] + [0]*8, exact_state_limit=1)
+    assert assessed["residual_is_exact"] and assessed["residual_state_count"] == 1
+    assert assessed["objective_value"] == 0
+    checks += 1
+
+    # Controlled solver-limit injection: do not rely on hardware timing.
+    global _optimize_hybrid
+    original = _optimize_hybrid
+    def limited(*args, **kwargs):
+        raise SolverLimitReached("Test solver time limit")
+    def broken(*args, **kwargs):
+        raise RuntimeError("Test unexpected solver failure")
+    try:
+        _optimize_hybrid = limited
+        fallback = optimize_tas(["A", "B"], edges, [100, 0])
+        assert fallback.objective_value == 21 and fallback.screened_objective_value is None
+        assert fallback.optimality_scope == "feasible heuristic; not proven optimal"
+        assert any("limit reached" in note for note in fallback.screening_notes)
+        # The certain-fill path must bypass even a failing hybrid solver.
+        fast = optimize_tas(["A"], [Edge("A", None, "A", certain, 1)], [100])
+        assert fast.objective_value == 0 and fast.solver_path == "certain-fill min-cost flow"
+        try:
+            optimize_tas(["A", "B"], edges, [100, 0], screen=False)
+        except SolverLimitReached:
+            pass
+        else:
+            raise AssertionError("Unscreened time limits must still raise.")
+        checks += 2
+        _optimize_hybrid = broken
+        try:
+            optimize_tas(["A", "B"], edges, [100, 0])
+        except RuntimeError as exc:
+            assert "unexpected" in str(exc)
+        else:
+            raise AssertionError("Unexpected solver errors must not be disguised as timeouts.")
+        checks += 1
+    finally:
+        _optimize_hybrid = original
+
+    for bad in [-1, .5, np.nan]:
+        try:
+            screen_routes(["A", "B"], edges, [100, 0], max_routes=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Invalid candidate budgets must be rejected.")
+    checks += 1
+    return checks
 
 
 def self_test() -> None:
@@ -1316,7 +1836,7 @@ def self_test() -> None:
     else:
         raise AssertionError("Disconnected hedge should be infeasible.")
 
-    plan = twelve_contract_demo()
+    plan = twelve_contract_demo(screen=False)
     assert len(plan.result.contracts) == 12
     assert np.count_nonzero(plan.full_target) == 5 and plan.tas_available.sum() == 4
     assert plan.result.A.shape == (12, 20)
@@ -1446,12 +1966,13 @@ def self_test() -> None:
                     best, best_fee = score, fee
                 elif np.isclose(score, best, rtol=1e-12, atol=1e-10):
                     best_fee = min(best_fee, fee)
-        solved = optimize_tas(["A", "B"], tiny_edges, target, kappa=kappa)
+        solved = optimize_tas(["A", "B"], tiny_edges, target, kappa=kappa, screen=False)
         assert np.array_equal(solved.A @ solved.q, target)
         assert np.isclose(solved.objective_value, best, rtol=1e-8, atol=1e-6)
         assert np.isclose(solved.brokerage_if_fully_filled, best_fee)
         assert _is_acyclic(tiny_edges, solved.q)
         checks += 1
+    checks += _screening_self_test()
     print(f"Passed {checks} model checks, including 8 exhaustive tiny-network comparisons.")
 
 
@@ -1462,6 +1983,7 @@ if __name__ == "__main__":
     demos.add_argument("--twelve-contract-demo", action="store_true", help="12 maturities, targets on five, TAS on four (default)")
     demos.add_argument("--two-contract-demo", action="store_true", help="run the earlier two-contract toy example")
     demos.add_argument("--six-contract-demo", action="store_true", help="solve synthetic 4,000-lot example")
+    demos.add_argument("--dense-demo", action="store_true", help="12 TAS-open maturities, 156 routes, 4,000 gross lots")
     demos.add_argument("--all-filled-demo", action="store_true", help="12-maturity example with 100% fills on the four TAS-enabled maturities")
     parser.add_argument("--plot", default="tas_network.svg", help="SVG output path (default: tas_network.svg)")
     parser.add_argument("--no-plot", action="store_true", help="skip SVG output")
@@ -1471,15 +1993,22 @@ if __name__ == "__main__":
     parser.add_argument("--exact-state-limit", type=int, default=4096, help="maximum exact liquidity combinations per maturity")
     parser.add_argument("--residual-samples", type=int, default=2048, help="draws per maturity when exact integration exceeds the limit")
     parser.add_argument("--seed", type=int, default=2026, help="reproducible residual sampling seed")
-    parser.add_argument("--time-limit", type=float, default=60, help="seconds per solver phase; timeouts raise")
+    parser.add_argument("--time-limit", type=float, default=60, help="seconds per phase; screened hybrid timeout returns a labelled feasible fallback")
+    parser.add_argument("--no-screen", action="store_true", help="disable both the certainty fast path and route screening")
+    parser.add_argument("--screen-max-routes", type=int, default=24, help="candidate-route budget; feasible backbone protected; 0 disables budget")
+    parser.add_argument("--screen-max-incident", type=int, default=4, help="incident-route budget per maturity, excluding OR; 0 disables budget")
     args = parser.parse_args()
     if args.self_test:
         self_test()
     else:
         plan = None
         settings = dict(kappa=args.kappa, exact_state_limit=args.exact_state_limit,
-                        residual_samples=args.residual_samples, seed=args.seed, time_limit=args.time_limit)
-        if args.six_contract_demo:
+                        residual_samples=args.residual_samples, seed=args.seed, time_limit=args.time_limit,
+                        screen=not args.no_screen, screen_max_routes=args.screen_max_routes,
+                        screen_max_incident=args.screen_max_incident)
+        if args.dense_demo:
+            result = dense_network_demo(**settings)
+        elif args.six_contract_demo:
             result = six_contract_demo(**settings)
         elif args.two_contract_demo:
             result = optimize_tas(*toy_problem(), **settings)
